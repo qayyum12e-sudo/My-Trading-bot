@@ -99,8 +99,8 @@ TRADE_LOG_FILE     = 'trade_log.csv'
 #   per bar prevents this clustered-loss pattern.
 # ============================================================================
 
-MAX_ADVERSE_SLIPPAGE_PCT = 0.15   # if fill is >0.15% worse than signal entry, abort the trade
-MAX_NEW_POSITIONS_PER_BAR = 3     # max simultaneous new entries per 15-minute candle
+MAX_ADVERSE_SLIPPAGE_PCT = 0.30   # was 0.15 — too tight, was rejecting normal fills
+MAX_NEW_POSITIONS_PER_BAR = 8     # was 3 — too restrictive, was blocking most bars
 BAR_INTERVAL_MS = 15 * 60 * 1000  # 15-minute bar in milliseconds
 
 SUPABASE_URL = os.getenv('SUPABASE_URL', '')
