@@ -1,644 +1,464 @@
 """
-STEP 1 OF 4 — Candle Engine
-============================
-Binance Testnet WebSocket bot — dual strategy live runner
+STEP 2 OF 4 — Signal Detector
+==============================
+Receives every candle close from Step 1 (CandleEngine).
+Checks S1 entry conditions.
+Emits SignalEvent objects when a valid trade setup is found.
 
-What this file does:
-  - Connects to Binance Testnet WebSocket for all symbols
-  - Maintains a rolling window of closed 15m candles per symbol
-  - Computes all indicators on every candle close:
-      EMA9, EMA26, EMA200, MACD(12,26,9), ADX(14), DI+, DI−,
-      SMA44 (for MA44 strategy)
-  - Exposes a callback: on_candle_close(symbol, candle, indicators)
-  - Seeds indicator history by fetching REST candles on startup
-  - Handles reconnection automatically
+STRATEGY 1 — EMA 9/26 Cross + 6 Filters  (LONG + SHORT)
+  F1  EMA9 crosses EMA26
+  F2  Candle confirms direction + closes beyond both EMAs
+  F3  Close on correct side of EMA200
+  F4  ADX(14) > 25
+  F5  DI direction aligned
+  F6  MACD line/signal/histogram aligned
+  Entry: close of crossover candle (or N+1 if N fails F2-F6)
+  One trade per crossover. New signals blocked while trade open.
+
+How it connects:
+  from step2_signal_detector import SignalDetector, SignalEvent
+  detector = SignalDetector()
+  engine   = CandleEngine(SYMBOLS, callback=detector.on_candle_close)
+  engine.start()
+
+  # To receive signals, set a handler:
+  detector.on_signal = my_handler   # called with (SignalEvent,)
 
 Dependencies:
-  pip install websocket-client requests
-
-Run this file standalone to verify it connects and prints candle closes:
-  python3 step1_candle_engine.py
-
-Configuration (edit the block below):
-  TESTNET = True   → uses testnet.binance.vision
-  TESTNET = False  → uses live api.binance.com  (careful!)
+  requests  (already installed from Step 1)
 """
 
-import json
+import sys
+import io
 import threading
 import time
 import requests
 import logging
-import sys
-import io
-import os
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # dotenv optional for step1 standalone test
-from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Optional, Callable
 
-# Force UTF-8 output on Windows so special characters don't crash the logger
+# Fix Windows console encoding — must happen before any print or logging
 if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-TESTNET       = os.getenv('TESTNET', 'true').lower() == 'true'
-INTERVAL      = os.getenv('INTERVAL', '15m')
-CANDLE_LIMIT  = 300      # rolling window size per symbol (>=250 for EMA200)
-RECONNECT_SEC = 5        # seconds between reconnection attempts
-
-# Indicator periods
-EMA_FAST      = 9
-EMA_SLOW      = 26
-EMA_TREND     = 200
-MACD_FAST     = 12
-MACD_SLOW     = 26
-MACD_SIG      = 9
-ADX_PERIOD    = 14
-ATR_PERIOD    = 14
-MA44_PERIOD   = 44
-
-# Bybit REST and WebSocket endpoints
-# Candle seeding uses public Bybit REST — no API key needed.
-# Order placement uses demo or live depending on TESTNET flag.
-if TESTNET:
-    REST_DATA_BASE = "https://api-demo.bybit.com"
-    WS_BASE        = "wss://stream-demo.bybit.com/v5/public/linear"
-else:
-    REST_DATA_BASE = "https://api.bybit.com"
-    WS_BASE        = "wss://stream.bybit.com/v5/public/linear"
-
-# Bybit interval mapping (Bybit uses numeric minutes)
-BYBIT_INTERVAL = "15"   # 15-minute candles
-
-# All symbols in this list must exist on Binance Futures
-# All symbols use the futures stream — no spot stream
-
-# Symbols to monitor — 80 symbols verified against demo-fapi.binance.com
-# 34 validated coins — assigned to ATR buckets based on 1-year backtest
-# (2025-05-01 to 2026-05-06). Each coin trades with its optimal SL/TP
-# multipliers defined in step2_signal_detector.py COIN_ATR_CONFIG.
-SYMBOLS = [
-    # P1 — ATR 1.0x SL / 2.0x TP  (R:R 1:2 tight)
-    "ZROUSDT",    "DOGEUSDT",   "LINKUSDT",
-
-    # P2 — ATR 1.5x SL / 3.0x TP  (R:R 1:2 moderate)
-    "IMXUSDT",    "KAIAUSDT",   "AKTUSDT",    "RENDERUSDT", "JUPUSDT",
-
-    # P3 — ATR 1.0x SL / 3.0x TP  (R:R 1:3 tight)
-    "AVAXUSDT",   "ADAUSDT",    "PENGUUSDT",  "AEROUSDT",
-    "TONUSDT",    "WLDUSDT",    "BCHUSDT",
-
-    # P4 — ATR 1.5x SL / 4.5x TP  (R:R 1:3 moderate)
-    "AAVEUSDT",   "ZECUSDT",    "HBARUSDT",   "WIFUSDT",
-    "BATUSDT",    "XRPUSDT",    "CAKEUSDT",   "FETUSDT",    "PYTHUSDT",
-
-    # P5 — ATR 1.0x SL / 4.0x TP  (R:R 1:4 tight)
-    "ZKUSDT",     "ARBUSDT",    "PENDLEUSDT", "ENAUSDT",    "COMPUSDT",
-    "ENSUSDT",    "UNIUSDT",    "SOLUSDT",    "RUNEUSDT",   "INJUSDT",
-    "BNBUSDT",
-
-    # P6 — ATR 1.5x SL / 6.0x TP  (R:R 1:4 moderate)
-    "POLUSDT",    "AXSUSDT",    "MANAUSDT",   "GALAUSDT",   "QNTUSDT",
-    "SUNUSDT",
-]
-# Deduplicate while preserving order
-_seen = set(); _deduped = []
-for _s in SYMBOLS:
-    if _s not in _seen:
-        _seen.add(_s); _deduped.append(_s)
-SYMBOLS = _deduped
-
-# ============================================================================
-# LOGGING
-# ============================================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s  %(levelname)-7s  %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler(),
-    ]
-)
-log = logging.getLogger('candle_engine')
-
-# ============================================================================
-# INDICATOR CALCULATIONS
-# (same logic as backtest — operate on plain Python lists)
-# ============================================================================
-
-def _ema_from_list(values, period):
-    """Return EMA series (list, same length as values, None until warm)."""
-    n = len(values)
-    out = [None] * n
-    if n < period:
-        return out
-    k = 2.0 / (period + 1)
-    out[period - 1] = sum(values[:period]) / period
-    for i in range(period, n):
-        out[i] = values[i] * k + out[i - 1] * (1 - k)
-    return out
-
-
-def compute_indicators(candles):
-    """
-    Given a list of candle dicts:
-      {'t': timestamp_ms, 'o': float, 'h': float, 'l': float, 'c': float}
-    Returns a dict of indicator values AT THE LAST CANDLE, or None if
-    not enough data.
-    """
-    if len(candles) < EMA_TREND + 10:
-        return None
-
-    closes = [c['c'] for c in candles]
-    highs  = [c['h'] for c in candles]
-    lows   = [c['l'] for c in candles]
-    n      = len(candles)
-
-    # ── EMAs ────────────────────────────────────────────────────────────────
-    ema9_s   = _ema_from_list(closes, EMA_FAST)
-    ema26_s  = _ema_from_list(closes, EMA_SLOW)
-    ema200_s = _ema_from_list(closes, EMA_TREND)
-
-    ema9   = ema9_s[-1]
-    ema26  = ema26_s[-1]
-    ema200 = ema200_s[-1]
-
-    # Need previous values for crossover detection
-    ema9_prev  = ema9_s[-2]  if len(ema9_s)  >= 2 else None
-    ema26_prev = ema26_s[-2] if len(ema26_s) >= 2 else None
-
-    if None in (ema9, ema26, ema200, ema9_prev, ema26_prev):
-        return None
-
-    # ── MA44 (SMA) ───────────────────────────────────────────────────────────
-    ma44 = sum(closes[-MA44_PERIOD:]) / MA44_PERIOD if n >= MA44_PERIOD else None
-
-    # ── MACD ────────────────────────────────────────────────────────────────
-    ema12_s = _ema_from_list(closes, MACD_FAST)
-    ema26m_s = _ema_from_list(closes, MACD_SLOW)
-    macd_line_s = [None] * n
-    for i in range(n):
-        if ema12_s[i] is not None and ema26m_s[i] is not None:
-            macd_line_s[i] = ema12_s[i] - ema26m_s[i]
-
-    # Signal = EMA(9) of MACD line
-    first_valid = next((i for i, v in enumerate(macd_line_s) if v is not None), None)
-    macd_sig_s  = [None] * n
-    macd_hist_s = [None] * n
-    if first_valid is not None:
-        seed_end = first_valid + MACD_SIG
-        if seed_end <= n:
-            vals = [macd_line_s[i] for i in range(first_valid, seed_end) if macd_line_s[i] is not None]
-            if len(vals) == MACD_SIG:
-                k = 2.0 / (MACD_SIG + 1)
-                macd_sig_s[seed_end - 1] = sum(vals) / MACD_SIG
-                for i in range(seed_end, n):
-                    if macd_line_s[i] is not None and macd_sig_s[i - 1] is not None:
-                        macd_sig_s[i] = macd_line_s[i] * k + macd_sig_s[i - 1] * (1 - k)
-                for i in range(n):
-                    if macd_line_s[i] is not None and macd_sig_s[i] is not None:
-                        macd_hist_s[i] = macd_line_s[i] - macd_sig_s[i]
-
-    macd      = macd_line_s[-1]
-    macd_sig  = macd_sig_s[-1]
-    macd_hist = macd_hist_s[-1]
-
-    # ── ADX / DI+ / DI− (Wilder) ────────────────────────────────────────────
-    p = ADX_PERIOD
-    tr_raw = [0.0] * n
-    dm_p   = [0.0] * n
-    dm_n   = [0.0] * n
-    for i in range(1, n):
-        h, l, pc = highs[i], lows[i], closes[i - 1]
-        tr_raw[i] = max(h - l, abs(h - pc), abs(l - pc))
-        up   = highs[i]    - highs[i - 1]
-        down = lows[i - 1] - lows[i]
-        if up > down and up > 0:   dm_p[i] = up
-        if down > up and down > 0: dm_n[i] = down
-
-    s_tr = [0.0]*n; s_dp = [0.0]*n; s_dn = [0.0]*n
-    if n > p:
-        s_tr[p] = sum(tr_raw[1:p+1])
-        s_dp[p] = sum(dm_p[1:p+1])
-        s_dn[p] = sum(dm_n[1:p+1])
-        for i in range(p+1, n):
-            s_tr[i] = s_tr[i-1] - s_tr[i-1]/p + tr_raw[i]
-            s_dp[i] = s_dp[i-1] - s_dp[i-1]/p + dm_p[i]
-            s_dn[i] = s_dn[i-1] - s_dn[i-1]/p + dm_n[i]
-
-    dx_s = [None]*n
-    di_pos_s = [None]*n
-    di_neg_s = [None]*n
-    for i in range(p, n):
-        atr_v = s_tr[i]
-        if atr_v == 0: continue
-        dip = 100.0 * s_dp[i] / atr_v
-        din = 100.0 * s_dn[i] / atr_v
-        di_pos_s[i] = dip; di_neg_s[i] = din
-        denom = dip + din
-        dx_s[i] = 0.0 if denom == 0 else 100.0 * abs(dip - din) / denom
-
-    first_dx = next((i for i in range(n) if dx_s[i] is not None), None)
-    adx_s = [None]*n
-    if first_dx is not None:
-        se = first_dx + p
-        if se <= n:
-            sv = [dx_s[i] for i in range(first_dx, se) if dx_s[i] is not None]
-            if len(sv) == p:
-                adx_s[se-1] = sum(sv) / p
-                for i in range(se, n):
-                    if dx_s[i] is not None and adx_s[i-1] is not None:
-                        adx_s[i] = (adx_s[i-1] * (p-1) + dx_s[i]) / p
-
-    adx    = adx_s[-1]
-    di_pos = di_pos_s[-1]
-    di_neg = di_neg_s[-1]
-
-    # ── ATR (Wilder, for MA44 strategy F7) ──────────────────────────────────
-    atr_s = [None] * n
-    tr2   = [0.0] * n
-    for i in range(1, n):
-        tr2[i] = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
-    if n > ATR_PERIOD:
-        atr_s[ATR_PERIOD] = sum(tr2[1:ATR_PERIOD+1]) / ATR_PERIOD
-        for i in range(ATR_PERIOD+1, n):
-            atr_s[i] = (atr_s[i-1] * (ATR_PERIOD-1) + tr2[i]) / ATR_PERIOD
-    atr = atr_s[-1]
-
-    # ── MA44 slope series (need last 8 values) ───────────────────────────────
-    ma44_slope_8bar = None
-    if n >= MA44_PERIOD + 8:
-        ma44_now  = sum(closes[-MA44_PERIOD:])      / MA44_PERIOD
-        ma44_8ago = sum(closes[-MA44_PERIOD-8:-8])  / MA44_PERIOD
-        if ma44_now > 0:
-            ma44_slope_8bar = (ma44_now - ma44_8ago) / ma44_now * 100
-
-    # ── MA44 accel (retained for future strategies; not used by S1) ──────────
-    ma44_accel = None
-    if n >= MA44_PERIOD + 8:
-        ma44_now   = sum(closes[-MA44_PERIOD:])       / MA44_PERIOD
-        ma44_4ago  = sum(closes[-MA44_PERIOD-4:-4])   / MA44_PERIOD
-        ma44_8ago2 = sum(closes[-MA44_PERIOD-8:-8])   / MA44_PERIOD
-        slope_recent = ma44_now  - ma44_4ago
-        slope_prior  = ma44_4ago - ma44_8ago2
-        ma44_accel   = slope_recent - slope_prior
-
-    return {
-        # Raw OHLC snapshot (latest closed candle)
-        'open':   candles[-1]['o'],
-        'high':   candles[-1]['h'],
-        'low':    candles[-1]['l'],
-        'close':  candles[-1]['c'],
-        'time':   candles[-1]['t'],
-
-        # S1 indicators
-        'ema9':       ema9,
-        'ema26':      ema26,
-        'ema200':     ema200,
-        'ema9_prev':  ema9_prev,
-        'ema26_prev': ema26_prev,
-        'macd':       macd,
-        'macd_sig':   macd_sig,
-        'macd_hist':  macd_hist,
-        'adx':        adx,
-        'di_plus':    di_pos,
-        'di_minus':   di_neg,
-
-        # Extra indicators (MA44, ATR) — retained for compatibility; S1 does not use them
-        'ma44':           ma44,
-        'ma44_slope_8bar': ma44_slope_8bar,
-        'ma44_accel':     ma44_accel,
-        'atr':            atr,
-        'atr_pct':        (atr / candles[-1]['c'] * 100) if (atr and candles[-1]['c'] > 0) else None,
-    }
-
-
-# ============================================================================
-# CANDLE STORE — one rolling deque per symbol
-# ============================================================================
-
-class CandleStore:
-    """Thread-safe rolling candle buffer per symbol."""
-
-    def __init__(self, symbols, limit=CANDLE_LIMIT):
-        self._lock    = threading.Lock()
-        self._candles = {sym: deque(maxlen=limit) for sym in symbols}
-
-    def seed(self, symbol, candle_list):
-        """Load historical candles (list of dicts) at startup."""
-        with self._lock:
-            for c in candle_list:
-                self._candles[symbol].append(c)
-
-    def push(self, symbol, candle):
-        """Append a newly closed candle."""
-        with self._lock:
-            self._candles[symbol].append(candle)
-
-    def get_list(self, symbol):
-        """Return a snapshot list (safe copy) for indicator computation."""
-        with self._lock:
-            return list(self._candles[symbol])
-
-    def size(self, symbol):
-        with self._lock:
-            return len(self._candles[symbol])
-
-
-# ============================================================================
-# REST SEEDER — fetch historical candles at startup
-# ============================================================================
-
-def seed_symbol(symbol, store, limit=CANDLE_LIMIT):
-    """Fetch `limit` closed 15m candles from Bybit Linear REST and load into store."""
     try:
-        resp = requests.get(
-            f"{REST_DATA_BASE}/v5/market/kline",
-            params={
-                'category': 'linear',
-                'symbol':   symbol,
-                'interval': BYBIT_INTERVAL,
-                'limit':    limit,
-            },
-            timeout=15
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except AttributeError:
+        # reconfigure not available on older Python — use wrapper
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+log = logging.getLogger('signal_detector')
+
+# ============================================================================
+# CONFIGURATION — must match backtest parameters exactly
+# ============================================================================
+
+# Strategy 1
+S1_ADX_MIN        = 25.0
+S1_SL_PCT         = 0.5    # fallback SL if ATR unavailable
+S1_TP_PCT         = 1.5    # fallback TP if ATR unavailable
+
+# ============================================================================
+# PER-COIN ATR BUCKET CONFIG
+# Derived from 1-year backtest (2025-05-01 to 2026-05-06).
+# Each coin is assigned to its best-performing ATR pair:
+#   SL distance = sl_mult × ATR%  (hard-capped at ATR_SL_CAP_PCT)
+#   TP distance = tp_mult × ATR%  (hard-capped at ATR_TP_CAP_PCT)
+# ============================================================================
+
+ATR_SL_CAP_PCT = 3.0   # SL never wider than 3% of entry
+ATR_TP_CAP_PCT = 9.0   # TP never wider than 9% of entry
+
+COIN_ATR_CONFIG = {
+    # P1 — 1:2 tight
+    "ZROUSDT":    {"sl_mult": 1.0, "tp_mult": 2.0},
+    "DOGEUSDT":   {"sl_mult": 1.0, "tp_mult": 2.0},
+    "LINKUSDT":   {"sl_mult": 1.0, "tp_mult": 2.0},
+
+    # P2 — 1:2 moderate
+    "IMXUSDT":    {"sl_mult": 1.5, "tp_mult": 3.0},
+    "KAIAUSDT":   {"sl_mult": 1.5, "tp_mult": 3.0},
+    "AKTUSDT":    {"sl_mult": 1.5, "tp_mult": 3.0},
+    "RENDERUSDT": {"sl_mult": 1.5, "tp_mult": 3.0},
+    "JUPUSDT":    {"sl_mult": 1.5, "tp_mult": 3.0},
+
+    # P3 — 1:3 tight
+    "AVAXUSDT":   {"sl_mult": 1.0, "tp_mult": 3.0},
+    "ADAUSDT":    {"sl_mult": 1.0, "tp_mult": 3.0},
+    "PENGUUSDT":  {"sl_mult": 1.0, "tp_mult": 3.0},
+    "AEROUSDT":   {"sl_mult": 1.0, "tp_mult": 3.0},
+    "TONUSDT":    {"sl_mult": 1.0, "tp_mult": 3.0},
+    "WLDUSDT":    {"sl_mult": 1.0, "tp_mult": 3.0},
+    "BCHUSDT":    {"sl_mult": 1.0, "tp_mult": 3.0},
+
+    # P4 — 1:3 moderate
+    "AAVEUSDT":   {"sl_mult": 1.5, "tp_mult": 4.5},
+    "ZECUSDT":    {"sl_mult": 1.5, "tp_mult": 4.5},
+    "HBARUSDT":   {"sl_mult": 1.5, "tp_mult": 4.5},
+    "WIFUSDT":    {"sl_mult": 1.5, "tp_mult": 4.5},
+    "BATUSDT":    {"sl_mult": 1.5, "tp_mult": 4.5},
+    "XRPUSDT":    {"sl_mult": 1.5, "tp_mult": 4.5},
+    "CAKEUSDT":   {"sl_mult": 1.5, "tp_mult": 4.5},
+    "FETUSDT":    {"sl_mult": 1.5, "tp_mult": 4.5},
+    "PYTHUSDT":   {"sl_mult": 1.5, "tp_mult": 4.5},
+
+    # P5 — 1:4 tight
+    "ZKUSDT":     {"sl_mult": 1.0, "tp_mult": 4.0},
+    "ARBUSDT":    {"sl_mult": 1.0, "tp_mult": 4.0},
+    "PENDLEUSDT": {"sl_mult": 1.0, "tp_mult": 4.0},
+    "ENAUSDT":    {"sl_mult": 1.0, "tp_mult": 4.0},
+    "COMPUSDT":   {"sl_mult": 1.0, "tp_mult": 4.0},
+    "ENSUSDT":    {"sl_mult": 1.0, "tp_mult": 4.0},
+    "UNIUSDT":    {"sl_mult": 1.0, "tp_mult": 4.0},
+    "SOLUSDT":    {"sl_mult": 1.0, "tp_mult": 4.0},
+    "RUNEUSDT":   {"sl_mult": 1.0, "tp_mult": 4.0},
+    "INJUSDT":    {"sl_mult": 1.0, "tp_mult": 4.0},
+    "BNBUSDT":    {"sl_mult": 1.0, "tp_mult": 4.0},
+
+    # P6 — 1:4 moderate
+    "POLUSDT":    {"sl_mult": 1.5, "tp_mult": 6.0},
+    "AXSUSDT":    {"sl_mult": 1.5, "tp_mult": 6.0},
+    "MANAUSDT":   {"sl_mult": 1.5, "tp_mult": 6.0},
+    "GALAUSDT":   {"sl_mult": 1.5, "tp_mult": 6.0},
+    "QNTUSDT":    {"sl_mult": 1.5, "tp_mult": 6.0},
+    "SUNUSDT":    {"sl_mult": 1.5, "tp_mult": 6.0},
+}
+
+# ============================================================================
+# SIGNAL EVENT — the object passed to the order manager
+# ============================================================================
+
+@dataclass
+class SignalEvent:
+    """
+    Emitted when a valid trade setup is detected.
+    Step 3 (OrderManager) receives this and places the trade.
+    """
+    strategy:    str          # 'S1_EMA_CROSS'
+    symbol:      str          # e.g. 'BTCUSDT'
+    direction:   str          # 'LONG' or 'SHORT'
+    entry_price: float        # suggested entry (close of signal candle for S1)
+    sl_price:    float        # stop loss price
+    tp_price:    float        # take profit price
+    signal_ts:   int          # candle close timestamp (ms)
+    signal_time: str          # human-readable UTC string
+    reason:      str          # short human description of why signal fired
+
+    # Indicator snapshot at signal candle (for logging/audit)
+    indicators:  dict = field(default_factory=dict)
+
+
+# ============================================================================
+# PER-SYMBOL STATE — tracked independently for each symbol
+# ============================================================================
+
+class SymbolState:
+    """All mutable state for one symbol."""
+
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+
+        # S1 state
+        self.s1_trade_open      = False   # blocks new S1 signals while True
+        self.s1_last_cross_dir  = None    # direction of last crossover (prevents re-use)
+        self.s1_cross_candle_ts = None    # timestamp of crossover candle
+        self.s1_pending_dir     = None    # crossover detected, waiting for N+1 confirm
+        self.s1_pending_ts      = None    # ts of the crossover candle
+
+
+# ============================================================================
+# SIGNAL DETECTOR — main class
+# ============================================================================
+
+class SignalDetector:
+    """
+    Plug this into CandleEngine as the callback.
+
+        detector = SignalDetector()
+        detector.on_signal = my_trade_handler
+        engine = CandleEngine(SYMBOLS, callback=detector.on_candle_close)
+
+    on_signal is called with a SignalEvent whenever conditions are met.
+    It is called from the WebSocket message thread — keep it fast or
+    dispatch to a queue (Step 3 does this).
+    """
+
+    def __init__(self):
+        self._states  = {}                      # symbol -> SymbolState
+        self._lock    = threading.Lock()
+        self.on_signal: Optional[Callable] = None
+        # candle_list cache: updated by engine via set_candle_list()
+        self._candle_lists = {}                 # symbol -> list[dict]
+
+    # ── Called by CandleEngine to share candle history ────────────────────────
+    def set_candle_list(self, symbol: str, candle_list: list):
+        """CandleEngine calls this after each push so we have access to history."""
+        with self._lock:
+            self._candle_lists[symbol] = candle_list
+
+    def _get_state(self, symbol: str) -> SymbolState:
+        if symbol not in self._states:
+            self._states[symbol] = SymbolState(symbol)
+        return self._states[symbol]
+
+    # ── Main entry point — called by CandleEngine on every closed candle ──────
+    def on_candle_close(self, symbol: str, candle: dict, ind: dict):
+        """
+        symbol  : e.g. 'BTCUSDT'
+        candle  : {'t': ms, 'o': float, 'h': float, 'l': float, 'c': float}
+        ind     : output of compute_indicators() from Step 1
+        """
+        # Guard: skip if any critical indicator is None
+        required = ['ema9', 'ema26', 'ema200', 'ema9_prev', 'ema26_prev',
+                    'adx', 'di_plus', 'di_minus',
+                    'macd', 'macd_sig', 'macd_hist']
+        if any(ind.get(k) is None for k in required):
+            return
+
+        state    = self._get_state(symbol)
+
+        self._check_s1(symbol, candle, ind, state)
+
+    # ==========================================================================
+    # STRATEGY 1 — EMA 9/26 Cross
+    # ==========================================================================
+
+    def _check_s1(self, symbol: str, candle: dict, ind: dict, state: SymbolState):
+        # Block new signals while a trade is open on this symbol
+        if state.s1_trade_open:
+            return
+
+        c_close = candle['c']
+        c_open  = candle['o']
+        ts      = candle['t']
+
+        ema9       = ind['ema9'];      ema9_prev  = ind['ema9_prev']
+        ema26      = ind['ema26'];     ema26_prev = ind['ema26_prev']
+        ema200     = ind['ema200']
+        adx        = ind['adx']
+        di_plus    = ind['di_plus'];   di_minus   = ind['di_minus']
+        macd       = ind['macd'];      macd_sig   = ind['macd_sig']
+        macd_hist  = ind['macd_hist']
+
+        # ── Detect crossover on THIS candle ───────────────────────────────────
+        bullish_cross = (ema9_prev <= ema26_prev) and (ema9 > ema26)
+        bearish_cross = (ema9_prev >= ema26_prev) and (ema9 < ema26)
+
+        if bullish_cross or bearish_cross:
+            direction = 'LONG' if bullish_cross else 'SHORT'
+            # Store as pending — will attempt to confirm on this candle (N)
+            # and next candle (N+1) if this one fails
+            state.s1_pending_dir = direction
+            state.s1_pending_ts  = ts
+            log.debug(f"{symbol} S1: {direction} crossover detected at {_fmt_ts(ts)}")
+
+        # ── Attempt to confirm a pending crossover (candle N or N+1) ─────────
+        if state.s1_pending_dir is None:
+            return
+
+        direction = state.s1_pending_dir
+
+        # Only try for 2 candles (N and N+1) — if this is candle N+2, cancel
+        if ts > state.s1_pending_ts + 2 * 15 * 60 * 1000:
+            log.debug(f"{symbol} S1: crossover expired (no confirmation in 2 candles)")
+            state.s1_pending_dir = None
+            state.s1_pending_ts  = None
+            return
+
+        # F2 — candle confirm
+        if direction == 'LONG':
+            f2 = (c_close > c_open) and (c_close > ema9) and (c_close > ema26)
+        else:
+            f2 = (c_close < c_open) and (c_close < ema9) and (c_close < ema26)
+
+        if not f2:
+            return   # try again next candle (N+1)
+
+        # F3 — EMA200 trend gate  (ENABLED — required by backtest)
+        if direction == 'LONG'  and c_close <= ema200: return
+        if direction == 'SHORT' and c_close >= ema200: return
+
+        # F4 — ADX strength
+        if adx <= S1_ADX_MIN: return
+
+        # F5 — DI direction
+        if direction == 'LONG'  and not (di_plus > di_minus): return
+        if direction == 'SHORT' and not (di_minus > di_plus): return
+
+        # F6 — MACD momentum
+        if direction == 'LONG'  and not (macd > macd_sig and macd_hist > 0): return
+        if direction == 'SHORT' and not (macd < macd_sig and macd_hist < 0): return
+
+        # ── All 6 filters passed ─────────────────────────────────────────────
+        entry = c_close
+
+        # ── Per-coin ATR bucket SL/TP ─────────────────────────────────────────
+        atr_pct  = ind.get('atr_pct')
+        coin_cfg = COIN_ATR_CONFIG.get(symbol, {"sl_mult": 1.5, "tp_mult": 3.0})
+        sl_mult  = coin_cfg["sl_mult"]
+        tp_mult  = coin_cfg["tp_mult"]
+
+        if atr_pct is not None and atr_pct > 0:
+            sl_dist_pct = min(sl_mult * atr_pct, ATR_SL_CAP_PCT)
+            tp_dist_pct = min(tp_mult * atr_pct, ATR_TP_CAP_PCT)
+        else:
+            # Fallback to flat percentages if ATR unavailable
+            sl_dist_pct = S1_SL_PCT
+            tp_dist_pct = S1_TP_PCT
+
+        if direction == 'LONG':
+            sl = entry * (1 - sl_dist_pct / 100)
+            tp = entry * (1 + tp_dist_pct / 100)
+        else:
+            sl = entry * (1 + sl_dist_pct / 100)
+            tp = entry * (1 - tp_dist_pct / 100)
+
+        candle_label = 'N' if ts == state.s1_pending_ts else 'N+1'
+
+        signal = SignalEvent(
+            strategy    = 'S1_EMA_CROSS',
+            symbol      = symbol,
+            direction   = direction,
+            entry_price = entry,
+            sl_price    = sl,
+            tp_price    = tp,
+            signal_ts   = ts,
+            signal_time = _fmt_ts(ts),
+            reason      = (f"EMA{9}/{26} {direction} cross confirmed on candle {candle_label} | "
+                           f"ADX={adx:.1f} DI+={di_plus:.1f} DI-={di_minus:.1f} | "
+                           f"MACD={macd:.4f} Hist={macd_hist:.4f}"),
+            indicators  = {
+                'ema9': ema9, 'ema26': ema26, 'ema200': ema200,
+                'adx': adx, 'di_plus': di_plus, 'di_minus': di_minus,
+                'macd': macd, 'macd_sig': macd_sig, 'macd_hist': macd_hist,
+                'atr_pct': atr_pct,
+                'sl_dist_pct': sl_dist_pct,
+                'tp_dist_pct': tp_dist_pct,
+                'candle_label': candle_label,
+            }
         )
-        if resp.status_code != 200:
-            log.warning(f"Seed {symbol}: HTTP {resp.status_code}")
-            return False
-        data = resp.json()
-        # Bybit returns: result.list = [[startTime, open, high, low, close, volume, turnover], ...]
-        # sorted newest-first — reverse so oldest is first
-        rows = data.get('result', {}).get('list', [])
-        if not rows:
-            log.warning(f"Seed {symbol}: empty response")
-            return False
 
-        rows = list(reversed(rows))   # oldest -> newest
-        candles = []
-        for row in rows[:-1]:         # exclude the still-open last candle
-            candles.append({
-                't': int(row[0]),
-                'o': float(row[1]),
-                'h': float(row[2]),
-                'l': float(row[3]),
-                'c': float(row[4]),
-            })
-        store.seed(symbol, candles)
-        log.info(f"Seeded {symbol}: {len(candles)} candles")
-        return True
-    except Exception as e:
-        log.error(f"Seed {symbol} error: {e}")
-        return False
+        # Mark crossover consumed — open trade gate
+        state.s1_pending_dir = None
+        state.s1_pending_ts  = None
+        state.s1_trade_open  = True
 
+        log.info(f"[SIGNAL] {symbol} S1 {direction} | entry={entry:.4f} "
+                 f"SL={sl:.4f} TP={tp:.4f} | {signal.reason}")
 
-def seed_all(symbols, store):
-    """Seed all symbols in parallel threads."""
-    threads = []
-    for sym in symbols:
-        t = threading.Thread(target=seed_symbol, args=(sym, store), daemon=True)
-        t.start()
-        threads.append(t)
-        time.sleep(0.05)   # gentle rate limiting
-    for t in threads:
-        t.join()
-    log.info(f"Seeding complete. Sizes: " +
-             ", ".join(f"{s}={store.size(s)}" for s in symbols[:5]) + " ...")
+        self._emit(signal)
 
+    # ==========================================================================
+    # TRADE OUTCOME FEEDBACK — called by Step 3 when a trade closes
+    # ==========================================================================
 
-# ============================================================================
-# WEBSOCKET ENGINE
-# ============================================================================
-
-class CandleEngine:
-    """
-    Manages a combined WebSocket stream for all symbols.
-    Calls on_candle_close(symbol, candle_dict, indicators_dict) on each close.
-
-    Usage:
-        def my_callback(symbol, candle, indicators):
-            print(symbol, indicators['ema9'])
-
-        engine = CandleEngine(SYMBOLS, callback=my_callback)
-        engine.start()   # blocks forever, reconnects on drop
-    """
-
-    def __init__(self, symbols, callback=None):
-        self.symbols  = symbols
-        self.callback = callback
-        self.store    = CandleStore(symbols)
-        self._running = False
-        # Watchdog: tracks last time ANY websocket message arrived (not just candle closes).
-        # Binance sends partial-candle updates every ~1–2 seconds, so a silence of more than
-        # ~60 seconds means the stream is dead even if the socket reports "connected".
-        # Railway's network sometimes drops streams without delivering a close event, so we
-        # need this to detect it; the library's built-in ping/pong is not enough.
-        self._last_msg_ts = 0
-        self._ws_app      = None   # set inside _ws_loop so the watchdog can close it
-
-    def start(self):
-        """Seed history then start WebSocket loop (blocking)."""
-        log.info(f"CandleEngine starting — {len(self.symbols)} symbols")
-        log.info(f"Testnet: {TESTNET}  |  Interval: {INTERVAL}")
-
-        log.info("Seeding historical candles...")
-        seed_all(self.symbols, self.store)
-
-        self._running = True
-
-        # Start the watchdog before the websocket loop. It runs in its own daemon thread
-        # and force-closes the socket if no messages arrive for too long, which causes
-        # run_forever to return and the outer reconnect loop to fire.
-        watchdog = threading.Thread(target=self._watchdog_loop, daemon=True, name='ws_watchdog')
-        watchdog.start()
-
-        self._ws_loop()
-
-    def stop(self):
-        self._running = False
-
-    def _watchdog_loop(self):
+    def on_trade_closed(self, symbol: str, strategy: str, outcome: str):
         """
-        Detect silent websocket failures (connection 'open' but no data flowing).
-        On Railway and similar PaaS networks, streams sometimes die without
-        delivering a close frame, so the library never invokes on_close and
-        run_forever blocks forever. Checking message-arrival staleness is the
-        only reliable way to catch this.
+        Step 3 calls this when SL or TP is hit so the detector can:
+          - Clear the trade_open flag (allow new signals)
+
+        outcome: 'WIN' | 'LOSS'
         """
-        STALE_AFTER_SEC = 90   # Binance sends partial-candle updates every ~1-2s; 90s is generous
-        CHECK_EVERY_SEC = 30
-        while self._running:
-            time.sleep(CHECK_EVERY_SEC)
-            if self._last_msg_ts == 0:
-                # Haven't received the first message yet. Don't trip on cold start.
-                continue
-            silence = time.time() - self._last_msg_ts
-            if silence > STALE_AFTER_SEC:
-                log.warning(
-                    f"[WATCHDOG] No websocket messages for {silence:.0f}s — "
-                    f"stream appears frozen. Forcing reconnect."
-                )
-                ws = self._ws_app
-                if ws is not None:
-                    try:
-                        ws.close()   # makes run_forever return; outer loop reconnects
-                    except Exception as e:
-                        log.error(f"[WATCHDOG] Error closing stale socket: {e}")
-                # Reset so we don't keep firing close() in a loop while the new socket warms up
-                self._last_msg_ts = time.time()
+        state = self._get_state(symbol)
 
-    def _ws_loop(self):
-        """Outer loop — reconnects on any error. Bybit V5 linear stream."""
-        import websocket
-        import json as _json
+        if strategy == 'S1_EMA_CROSS':
+            state.s1_trade_open = False
+            log.info(f"{symbol} S1: trade closed ({outcome}) — gate open")
 
-        while self._running:
-            log.info(f"Connecting Bybit WebSocket ({len(self.symbols)} symbols)...")
+    # ==========================================================================
+    # INTERNAL HELPERS
+    # ==========================================================================
 
-            ws = websocket.WebSocketApp(
-                WS_BASE,
-                on_open    = self._on_open,
-                on_message = self._on_message,
-                on_error   = self._on_error,
-                on_close   = self._on_close,
-            )
-            self._ws_app = ws
-
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-
-            self._ws_app = None
-            if self._running:
-                log.warning(f"WebSocket disconnected. Reconnecting in {RECONNECT_SEC}s...")
-                time.sleep(RECONNECT_SEC)
-
-    def _on_open(self, ws):
-        log.info("Bybit WebSocket connected [OK]")
-        self._last_msg_ts = time.time()
-        # Subscribe to kline streams for all symbols
-        import json as _json
-        topics = [f"kline.{BYBIT_INTERVAL}.{sym}" for sym in self.symbols]
-        # Bybit allows max 10 topics per subscribe message — batch them
-        batch_size = 10
-        for i in range(0, len(topics), batch_size):
-            batch = topics[i:i + batch_size]
-            msg   = _json.dumps({"op": "subscribe", "args": batch})
-            ws.send(msg)
-            log.info(f"Subscribed to {batch}")
-
-    def _on_error(self, ws, error):
-        log.error(f"WebSocket error: {error}")
-
-    def _on_close(self, ws, code, msg):
-        log.info(f"WebSocket closed: {code} {msg}")
-
-    def _on_message(self, ws, raw):
-        self._last_msg_ts = time.time()
-        try:
-            import json as _json
-            msg = _json.loads(raw)
-
-            # Ignore subscription confirmations and pings
-            if 'op' in msg or 'ret_msg' in msg:
-                return
-
-            topic = msg.get('topic', '')
-            if not topic.startswith('kline.'):
-                return
-
-            data_list = msg.get('data', [])
-            if not data_list:
-                return
-
-            # Bybit sends array of candle objects
-            for k in data_list:
-                # Only process confirmed (closed) candles
-                if not k.get('confirm', False):
-                    continue
-
-                # Parse symbol from topic: "kline.15.BTCUSDT"
-                parts  = topic.split('.')
-                symbol = parts[2] if len(parts) >= 3 else ''
-                if symbol not in self.symbols:
-                    continue
-
-                candle = {
-                    't': int(k['start']),
-                    'o': float(k['open']),
-                    'h': float(k['high']),
-                    'l': float(k['low']),
-                    'c': float(k['close']),
-                }
-
-                self.store.push(symbol, candle)
-                candle_list = self.store.get_list(symbol)
-                indicators  = compute_indicators(candle_list)
-
-                ts = datetime.fromtimestamp(candle['t']/1000, tz=timezone.utc).strftime('%H:%M')
-                log.debug(f"{symbol} candle closed @ {ts}  close={candle['c']:.4f}  "
-                          f"indicators={'ready' if indicators else 'warming'}")
-
-                if indicators and self.callback:
-                    try:
-                        self.callback(symbol, candle, indicators)
-                    except Exception as e:
-                        log.error(f"Callback error for {symbol}: {e}", exc_info=True)
-
-        except Exception as e:
-            log.error(f"Message parse error: {e}", exc_info=True)
+    def _emit(self, signal: SignalEvent):
+        """Call the registered signal handler."""
+        if self.on_signal:
+            try:
+                self.on_signal(signal)
+            except Exception as e:
+                log.error(f"Signal handler error: {e}", exc_info=True)
+        else:
+            # No handler set yet — just log it
+            log.warning(f"Signal emitted but no handler set: {signal.symbol} "
+                        f"{signal.strategy} {signal.direction}")
 
 
 # ============================================================================
-# STANDALONE TEST — run this file directly to verify connectivity
+# HELPER
 # ============================================================================
 
-def _test_callback(symbol, candle, indicators):
-    ts = datetime.fromtimestamp(candle['t']/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-    print(
-        f"\n{'='*60}\n"
-        f"  {symbol}  |  {ts}\n"
-        f"  close={candle['c']:.4f}  open={candle['o']:.4f}\n"
-        f"  EMA9={indicators['ema9']:.4f}  EMA26={indicators['ema26']:.4f}  "
-        f"EMA200={indicators['ema200']:.4f}\n"
-        f"  ADX={indicators['adx']:.2f}  DI+={indicators['di_plus']:.2f}  "
-        f"DI-={indicators['di_minus']:.2f}\n"
-        f"  MACD={indicators['macd']:.4f}  Sig={indicators['macd_sig']:.4f}  "
-        f"Hist={indicators['macd_hist']:.4f}\n"
-        f"  MA44={indicators['ma44']:.4f}  slope={indicators['ma44_slope_8bar']:.3f}%  "
-        f"ATR%={indicators['atr_pct']:.3f}%\n"
-        f"{'='*60}"
-    )
+def _fmt_ts(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
+
+# ============================================================================
+# STANDALONE TEST — wire Step 1 + Step 2 together and watch for signals
+# ============================================================================
 
 if __name__ == '__main__':
-    mode = 'Testnet' if TESTNET else 'LIVE'
-    order_mode = 'Testnet (paper money)' if TESTNET else 'LIVE (real money!)'
+    logging.basicConfig(
+        level   = logging.INFO,
+        format  = '%(asctime)s  %(levelname)-7s  %(message)s',
+        datefmt = '%Y-%m-%d %H:%M:%S',
+        handlers = [
+            logging.FileHandler('bot.log', encoding='utf-8'),
+            logging.StreamHandler(sys.stdout),
+        ]
+    )
+
+    # Import Step 1
+    try:
+        from step1_candle_engine import CandleEngine, SYMBOLS
+    except ImportError:
+        print("ERROR: step1_candle_engine.py must be in the same folder.")
+        sys.exit(1)
+
+    # ── Signal handler (prints to terminal) ───────────────────────────────────
+    def handle_signal(sig: SignalEvent):
+        print(f"""
++{'='*62}+
+|  *** SIGNAL DETECTED ***
+|  Strategy : {sig.strategy}
+|  Symbol   : {sig.symbol}
+|  Direction: {sig.direction}
+|  Time     : {sig.signal_time}
+|  Entry    : {sig.entry_price:.4f}
+|  SL       : {sig.sl_price:.4f}
+|  TP       : {sig.tp_price:.4f}
+|  Reason   : {sig.reason[:55]}
++{'='*62}+
+""")
+
+    # ── Wire Step 1 -> Step 2 ────────────────────────────────────────────────
+    detector = SignalDetector()
+    detector.on_signal = handle_signal
+
+    # Patch CandleEngine to also share candle lists with detector
+    original_on_message = None
+
+    def patched_callback(symbol, candle, indicators):
+        # Share candle list with detector before calling on_candle_close
+        from step1_candle_engine import CandleEngine as CE
+        candle_list = engine.store.get_list(symbol)
+        detector.set_candle_list(symbol, candle_list)
+        detector.on_candle_close(symbol, candle, indicators)
+
+    TEST_SYMBOLS = SYMBOLS   # watch all symbols
+    engine = CandleEngine(TEST_SYMBOLS, callback=patched_callback)
+
     print(f"""
 +------------------------------------------------------+
-|  STEP 1 -- Candle Engine  (standalone test mode)     |
+|  STEP 2 -- Signal Detector  (test mode)              |
 |                                                      |
-|  Connects to Binance {mode:<31}|
-|  Watching {len(SYMBOLS)} symbols on {INTERVAL:<36}|
+|  Watching {len(TEST_SYMBOLS)} symbols on 15m candles            |
+|  S1: EMA 9/26 Cross + 6 filters (LONG + SHORT)       |
 |                                                      |
-|  Market data : live Binance (public, no key needed)  |
-|  Orders      : {order_mode:<37}|
+|  Signals print here when detected.                   |
+|  Also logged to bot.log                              |
 |  Press Ctrl+C to stop.                               |
 +------------------------------------------------------+
 """)
 
-    # Reduce symbol list for testing so seed is fast
-    TEST_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
-    print(f"Test mode: watching {TEST_SYMBOLS}\n")
-
-    engine = CandleEngine(TEST_SYMBOLS, callback=_test_callback)
     try:
         engine.start()
     except KeyboardInterrupt:
